@@ -41,6 +41,14 @@ static BOOL YMHasRegisteredDyldCallback = NO;
 // 群员退群监控 Patch 状态
 static BOOL YMHasPatchedGroupExitMonitor = NO;
 
+static BOOL YMHasPatchedOpenURLWithSystemBrowser = NO;
+
+// 开关统一在构造函数里
+static BOOL YMFeatureAntiUpdateEnabled = NO;
+static BOOL YMFeatureAntiRevokeEnabled = NO;
+static BOOL YMFeatureGroupExitMonitorEnabled = NO;
+static BOOL YMFeatureOpenURLWithSystemBrowserEnabled = NO;
+
 //static const uintptr_t YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64;
 
 // 先声明，后面 constructor、multi open、anti revoke、群员退群监控都会用。
@@ -48,6 +56,7 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
 static void YMRegisterDyldCallbackIfNeeded(void);
 static void YMInstallMultiOpenPatch(void);
 static void YMInstallGroupExitMonitorPatch(void);
+static void YMInstallOpenURLWithSystemBrowserPatch(void);
 
 typedef enum {
     YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
@@ -116,6 +125,8 @@ typedef struct {
     uintptr_t revokeOriginCallsiteZeroBranchVA;
     uintptr_t revokeDeleteMessagesVA;
 
+    uintptr_t openURLWebViewKindVA;
+
     YMMessageWrapLayout layout;
     
     YMRevokeHookMode hookMode;//4.1.10添加
@@ -149,10 +160,9 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         // sub_3822FA4：内部会构造 type=10000 + paymsg XML，然后调用 ym_AddLocalMessageWrap。
         .insertPaySysMsgToSessionVA = 0x3822FA4, // [CDATA]->
         .YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64,
-        // 4.1.9 暂时没有适配这个进程数量检测点，填 0 表示跳过。
         .YMGetMainWeixinProcessCountVA = 0x449E2BC,
 
-        // 群员退群监控 4.1.9 暂未适配，填 0 自动跳过。
+        //4.1.9懒得搞了,以最新为准
         .groupExitDBApplyVA = 0,
         .groupExitFMessagePreVA = 0,
         .groupExitUpdateSessionCacheVA = 0,
@@ -161,6 +171,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeOriginCallsiteContinueVA = 0,
         .revokeOriginCallsiteZeroBranchVA = 0,
         .revokeDeleteMessagesVA = 0,
+
+        .openURLWebViewKindVA = 0,
 
         .layout = {
             .messageWrapSize = 616,
@@ -229,6 +241,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         
         .revokeDeleteMessagesVA = 0x2814B9C,//->Lhook->DeleteMessages
 
+        .openURLWebViewKindVA = 0x1C7C6AC, //->Lhook->GetUrlWebViewKind
+
         .layout = {
             .messageWrapSize = 616,
 
@@ -268,6 +282,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .revokeOriginCallsiteContinueVA = 新版继续执行地址，没有就填 0,
          .revokeOriginCallsiteZeroBranchVA = 新版 CBZ 分支地址，没有就填 0,
          .revokeDeleteMessagesVA = 新版 DeleteMessages 函数入口地址，没有就填 0,
+         .openURLWebViewKindVA = 新版 GetUrlWebViewKind 函数入口地址，没有就填 0,
 
          .layout = {
              .messageWrapSize = 616,
@@ -334,12 +349,16 @@ static std::atomic_bool YMGroupExitCallingOriginalFMessagePre(false);
 static std::atomic_bool YMGroupExitCallingOriginalUpdateSessionCache(false);
 static std::atomic_bool YMGroupExitFlushingPending(false);
 
-// 统一读取退群监控开关。
-// 注意：安装 hook 前要判断；hook 已经安装后也要在 hook 内判断。
-// 因为 ARM64 inline hook 一旦写入当前进程，单纯把 NSUserDefaults 改成 false，
-// 已经安装的 hook 不会自动消失。
 static BOOL YMIsGroupExitMonitorEnabled(void) {
-    return [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
+    return YMFeatureGroupExitMonitorEnabled;
+}
+
+static BOOL YMIsAntiRevokeEnabled(void) {
+    return YMFeatureAntiRevokeEnabled;
+}
+
+static BOOL YMIsOpenURLWithSystemBrowserEnabled(void) {
+    return YMFeatureOpenURLWithSystemBrowserEnabled;
 }
 
 #pragma mark - 日志
@@ -1108,6 +1127,75 @@ static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
 }
 
 /*
+ ARM64 int 强制返回：
+
+   mov w0, #value
+   ret
+ */
+static BOOL YMPatchARM64ReturnInt32(uintptr_t address, uint32_t value, const char *name) {
+    if (address == 0) {
+        YMLog(@"%s patch failed: address is zero", name);
+        return NO;
+    }
+
+    if (value > 0xFFFF) {
+        YMLog(@"%s patch failed: value too large: %u", name, value);
+        return NO;
+    }
+
+    void *target = (void *)address;
+
+    uint32_t patch[2] = {
+        0x52800000 | ((value & 0xFFFF) << 5), // mov w0, #value
+        0xD65F03C0                            // ret
+    };
+
+    YMPrintCodeBytes(name, "before", target);
+
+    uint32_t current[2] = {0};
+    memcpy(current, target, sizeof(current));
+
+    if (current[0] == patch[0] && current[1] == patch[1]) {
+        YMLog(@"%s already patched, address=0x%lx", name, (unsigned long)address);
+        return YES;
+    }
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                           name,
+                           "RW|COPY")) {
+        return NO;
+    }
+
+    memcpy(target, patch, sizeof(patch));
+    sys_icache_invalidate(target, sizeof(patch));
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_EXECUTE,
+                           name,
+                           "RX")) {
+        return NO;
+    }
+
+    uint32_t check[2] = {0};
+    memcpy(check, target, sizeof(check));
+
+    BOOL ok = check[0] == patch[0] && check[1] == patch[1];
+
+    YMPrintCodeBytes(name, "after", target);
+
+    YMLog(@"%s patch result=%@, address=0x%lx, value=%u",
+          name,
+          ok ? @"OK" : @"FAIL",
+          (unsigned long)address,
+          value);
+
+    return ok;
+}
+
+/*
  4.1.10
  ARM64 函数入口绝对跳转：
 
@@ -1119,13 +1207,6 @@ static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
    50 00 00 58
    00 02 1F D6
    hookAddress 8 bytes
-
- 说明：
-   1. x16 是临时寄存器，按 ABI 可以用。
-   2. 不改 x0/x1，所以 YMHandleSysMsgRevokeMsgHook(a1, a2) 能正常收到参数。
-   3. 原函数是被 BL 调用的，LR 已经是上层返回地址。
-      用 BR 跳到 hook，hook 最后 ret，会直接回到原调用者。
-   4. 这里不需要 trampoline，因为就是要阻止原撤回逻辑继续执行。
  */
 static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
                                      uintptr_t targetAddress,
@@ -2308,12 +2389,6 @@ static BOOL YMFindAndPatchLoadedGroupExitWeChatDylib(void) {
 }
 
 static void YMInstallGroupExitMonitorPatch(void) {
-    if (!YMIsGroupExitMonitorEnabled()) {
-        YMLog(@"[GroupExitMonitor] disabled by user defaults, skip install");
-        YMGroupExitClearRuntimeStateIfDisabled("install skip");
-        return;
-    }
-
     if (YMHasPatchedGroupExitMonitor) {
         return;
     }
@@ -3231,6 +3306,85 @@ static void YMInstallMultiOpenPatch(void) {
     YMFindAndPatchLoadedMultiOpenWeChatDylib();
 }
 
+#pragma mark - URL 外部浏览器 Patch
+
+static BOOL YMPatchOpenURLWithSystemBrowserWithSlide(intptr_t slide, NSString *source) {
+    if (YMHasPatchedOpenURLWithSystemBrowser) {
+        YMLog(@"open url system browser already patched, skip. source=%@", source ?: @"");
+        return YES;
+    }
+
+    if (!YMIsTargetWeChatVersion()) {
+        YMLog(@"open url system browser unsupported version, skip. source=%@", source ?: @"");
+        return NO;
+    }
+
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || profile->openURLWebViewKindVA == 0) {
+        YMLog(@"open url system browser address is zero, skip. profile=%s", profile ? profile->displayName : "NULL");
+        return NO;
+    }
+
+    YMWeChatDylibSlide = (uintptr_t)slide;
+
+    uintptr_t address = YMRuntimeAddress(profile->openURLWebViewKindVA);
+    YMLog(@"try install open url system browser patch from %@, profile=%s, slide=0x%lx, GetUrlWebViewKind=0x%lx",
+          source ?: @"",
+          profile->displayName,
+          (unsigned long)YMWeChatDylibSlide,
+          (unsigned long)address);
+
+    // 3 = use sys。
+    BOOL ok = YMPatchARM64ReturnInt32(address,
+                                      3,
+                                      "open url: GetUrlWebViewKind -> return 3");
+
+    YMHasPatchedOpenURLWithSystemBrowser = ok;
+    return ok;
+}
+
+static BOOL YMFindAndPatchLoadedOpenURLWithSystemBrowserDylib(void) {
+    uint32_t count = _dyld_image_count();
+
+    YMLog(@"scan dyld images for open url system browser, count=%u", count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) {
+            continue;
+        }
+
+        NSString *imagePath = [NSString stringWithUTF8String:name];
+
+        if (!YMIsTargetWeChatResourceDylibPath(imagePath)) {
+            continue;
+        }
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        YMLog(@"found Resources/wechat.dylib for open url system browser: index=%u, slide=0x%lx, path=%@",
+              i,
+              (unsigned long)slide,
+              imagePath);
+
+        return YMPatchOpenURLWithSystemBrowserWithSlide(slide, @"dyld image scan");
+    }
+
+    YMLog(@"Resources/wechat.dylib not found for open url system browser");
+    return NO;
+}
+
+static void YMInstallOpenURLWithSystemBrowserPatch(void) {
+    if (YMHasPatchedOpenURLWithSystemBrowser) {
+        return;
+    }
+
+    YMRegisterDyldCallbackIfNeeded();
+    YMFindAndPatchLoadedOpenURLWithSystemBrowserDylib();
+}
+
+
+#pragma mark - tool
 static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
     const char *name = NULL;
 
@@ -3262,21 +3416,15 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
      */
     YMPatchMultiOpenWithWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
 
-    /*
-     群员退群监控受 kExitChatroom 控制。
-     注意：dyld callback 是多开/防撤回共用的，不能在这里无条件安装退群 hook。
-     */
-    if (YMIsGroupExitMonitorEnabled()) {
-        YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
-    } else {
-        YMLog(@"[GroupExitMonitor] disabled by user defaults, skip dyld callback patch");
-        YMGroupExitClearRuntimeStateIfDisabled("dyld add image callback");
+    if (YMIsOpenURLWithSystemBrowserEnabled()) {
+        YMPatchOpenURLWithSystemBrowserWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 
-    /*
-     防撤回仍然受用户开关控制。
-     */
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
+    if (YMIsGroupExitMonitorEnabled()) {
+        YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
+    }
+
+    if (YMIsAntiRevokeEnabled()) {
         YMPatchAntiRevokeWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 }
@@ -3302,37 +3450,25 @@ static void YMInstallAssistantMenu(void) {
 }
 
 static void YMInstallAntiUpdateIfNeeded(void) {
+    if (!YMFeatureAntiUpdateEnabled) {
+        YMLog(@"anti update disabled, skip");
+        return;
+    }
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSString *loadFlag = [[NSUserDefaults standardUserDefaults] objectForKey:kIsFirstLoad];
-        if (loadFlag.length < 3) {
-            [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAntiUpdate];
-            [[NSUserDefaults standardUserDefaults] setObject:@"SOVIET" forKey:kIsFirstLoad];
-        }
-
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiUpdate]) {
-            YMDisableSparkleAutoUpdateDefaults();
-            YMDisableSparkleByRuntimeHook();
-        }
+        YMDisableSparkleAutoUpdateDefaults();
+        YMDisableSparkleByRuntimeHook();
     });
 }
 
 static void YMInstallAntiRevokeIfNeeded(void) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
-        YMLog(@"anti revoke disabled by user defaults, skip");
+    if (!YMIsAntiRevokeEnabled()) {
+        YMLog(@"anti revoke disabled, skip");
         return;
     }
 
-    /*
-     先注册 dyld 回调。
-     如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
-    */
     YMRegisterDyldCallbackIfNeeded();
-
-    /*
-     再主动扫描一次。
-     如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
-    */
     YMInstallAntiRevokePatch();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
@@ -3346,73 +3482,72 @@ static void YMInstallAntiRevokeIfNeeded(void) {
     });
 }
 
+static void YMInstallGroupExitMonitorIfNeeded(void) {
+    if (!YMIsGroupExitMonitorEnabled()) {
+        YMLog(@"[GroupExitMonitor] disabled, skip");
+        YMGroupExitClearRuntimeStateIfDisabled("constructor skip");
+        return;
+    }
+
+    YMInstallGroupExitMonitorPatch();
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YMInstallGroupExitMonitorPatch();
+    });
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YMInstallGroupExitMonitorPatch();
+    });
+}
+
+static void YMInstallOpenURLWithSystemBrowserIfNeeded(void) {
+    if (!YMIsOpenURLWithSystemBrowserEnabled()) {
+        YMLog(@"open url system browser disabled, skip");
+        return;
+    }
+
+    YMInstallOpenURLWithSystemBrowserPatch();
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YMInstallOpenURLWithSystemBrowserPatch();
+    });
+}
 
 #pragma mark - constructor
+
+#pragma mark - 开关
+
+static void YMLoadFeatureSwitchesFromDefaults(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+    NSString *loadFlag = [defaults objectForKey:kIsFirstLoad];
+    if (loadFlag.length < 3) {
+        [defaults setBool:YES forKey:kAntiUpdate];
+        [defaults setObject:@"SOVIET" forKey:kIsFirstLoad];
+    }
+
+    YMFeatureAntiUpdateEnabled = [defaults boolForKey:kAntiUpdate];
+    YMFeatureAntiRevokeEnabled = [defaults boolForKey:kAntiRevoke];
+    YMFeatureGroupExitMonitorEnabled = [defaults boolForKey:kExitChatroom];
+    YMFeatureOpenURLWithSystemBrowserEnabled = [defaults boolForKey:kUseSystemWeb];
+}
 
 __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
     @autoreleasepool {
         YMLog(@"constructor called");
-        /// 多开必须尽早执行，不能 dispatch_after。
+        
+        YMLoadFeatureSwitchesFromDefaults();
+
         YMInstallMultiOpenPatch();
-
-        BOOL exitChat = [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
-        if (exitChat) {
-            YMInstallGroupExitMonitorPatch();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallGroupExitMonitorPatch();
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallGroupExitMonitorPatch();
-            });
-        }
         
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [[MenuManager shareInstance] initAssistantMenuItems];
-        });
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSString *loadFlag = [[NSUserDefaults standardUserDefaults] objectForKey:kIsFirstLoad];
-            if (loadFlag.length < 3) {
-                [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAntiUpdate];
-                [[NSUserDefaults standardUserDefaults] setObject:@"SOVIET" forKey:kIsFirstLoad];
-            }
-            
-            if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiUpdate]) {
-                YMDisableSparkleAutoUpdateDefaults();
-                YMDisableSparkleByRuntimeHook();
-            }
-        });
-        
-        
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
-            /*
-             先注册 dyld 回调。
-             如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
-            */
-            YMRegisterDyldCallbackIfNeeded();
-
-            /*
-             再主动扫描一次。
-             如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
-            */
-            YMInstallAntiRevokePatch();
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallAntiRevokePatch();
-            });
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallAntiRevokePatch();
-            });
-        }
-
+        YMInstallOpenURLWithSystemBrowserIfNeeded();
+        YMInstallGroupExitMonitorIfNeeded();
+        YMInstallAssistantMenu();
+        YMInstallAntiUpdateIfNeeded();
+        YMInstallAntiRevokeIfNeeded();
     }
 }
-
