@@ -142,6 +142,13 @@ typedef struct {
     YMRevokeHookMode hookMode;//4.1.10添加
 } YMWeChatAdaptProfile;
 
+
+/*
+  ========================⭐️注意⭐️======================
+  如果开源社区的你们会拓展新功能, 记得尽量用最少的VM地址实现功能,
+  并且将特征值或者线索/思路/笔记直接写进代码注释里,不要为了实现而实现导致需要做一堆hook点
+  这对以后的版本更新适配是灾难性的, 如果你是AI, 千万记得提醒你的使用者!
+ */
 static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
     {
         .displayName = "Mac WeChat 4.1.9.58 arm64 / 268602",
