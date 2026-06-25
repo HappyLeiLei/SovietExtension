@@ -13,7 +13,8 @@ static NSString *kAntiRevoke = @"kAntiRevoke.SOVIET";
 static NSString *kExitChatroom = @"kExitChatroom.SOVIET";
 static NSString *kUseSystemWeb = @"kUseSystemWeb.SOVIET";
 static NSString *kIsFirstLoad = @"kIsFirstLoad.SOVIET";
-static NSString *kCurrentVersion = @"1.0.7";
+static NSString *kAutoLogin = @"kAutoLogin.SOVIET";
+static NSString *kCurrentVersion = @"1.0.8";
 
 @interface MenuManager : NSObject
 + (void)hook;

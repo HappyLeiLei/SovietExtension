@@ -44,6 +44,10 @@
                                                                 key:kUseSystemWeb
                                                              action:@selector(onUseSystemWeb:)];
     
+    NSMenuItem *autoLoginMenu = [self ym_toggleMenuItemWithTitle:@"自动登录"
+                                                                key:kAutoLogin
+                                                          action:@selector(onAutoLogin:)];
+    
     NSMenuItem *newWeChatMenu = [NSMenuItem menuItemWithTitle:@"多开"
                                                        action:@selector(onNewWeChat:)
                                                        target:self
@@ -63,6 +67,7 @@
         antiUpdateMenu,
         antiRevokeMenu,
         exitChatroomMenu,
+        autoLoginMenu,
         useSystemWebMenu,
         newWeChatMenu,
         currentVersionMenu
@@ -97,6 +102,13 @@
 {
     [self ym_confirmToggleMenuItem:item
                    userDefaultsKey:kExitChatroom
+                   informativeText:@"重启微信生效"];
+}
+
+- (void)onAutoLogin:(NSMenuItem *)item
+{
+    [self ym_confirmToggleMenuItem:item
+                   userDefaultsKey:kAutoLogin
                    informativeText:@"重启微信生效"];
 }
 
