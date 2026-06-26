@@ -755,7 +755,7 @@ backup_executable
 restore_clean_executable
 copy_framework
 insert_framework
-sign_app
 write_state_file
+sign_app
 verify_install
 print_done
