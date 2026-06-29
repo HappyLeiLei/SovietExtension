@@ -275,6 +275,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeDeleteMessagesVA = 0x2814B9C,//->Lhook->DeleteMessages
 
         .openURLWebViewKindVA = 0x1C7C6AC, //->Lhook->GetUrlWebViewKind
+        
+        //String里"SendMsg",pesudo中有简短的" is empty"
         .sendMsgCGIVA = 0x8da920,   // sub_8da920: SendMsg CGI dispatcher
 
         .layout = {
