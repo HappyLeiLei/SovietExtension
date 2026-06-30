@@ -61,6 +61,7 @@
 > 不在表格中的版本暂不保证可用。
 > 即使大版本看起来一样，只要 Build 号不同，也可能无法使用。
 
+[wechat-versions历史版本下载](https://github.com/zsbai/wechat-versions/releases)
 ---
 
 ## Install / 安装
