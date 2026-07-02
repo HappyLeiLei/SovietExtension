@@ -208,7 +208,9 @@ quit_wechat() {
 }
 
 is_injected() {
-    if otool -l "${APP_EXECUTABLE_PATH}" 2>/dev/null | grep -q "${FRAMEWORK_NAME}"; then
+    local otool_out
+    otool_out=$(otool -l "${APP_EXECUTABLE_PATH}" 2>/dev/null) || true
+    if [ -n "${otool_out}" ] && echo "${otool_out}" | grep -q "${FRAMEWORK_NAME}"; then
         return 0
     fi
 

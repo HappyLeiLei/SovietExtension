@@ -532,8 +532,12 @@ is_executable_injected() {
 
     [ -f "${executable}" ] || return 1
 
-    otool -l "${executable}" 2>/dev/null | grep -q "${LOAD_DYLIB_PATH}" && return 0
-    otool -l "${executable}" 2>/dev/null | grep -q "${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}" && return 0
+    local otool_out
+    otool_out=$(otool -l "${executable}" 2>/dev/null) || true
+    if [ -n "${otool_out}" ]; then
+        echo "${otool_out}" | grep -q "${LOAD_DYLIB_PATH}" && return 0
+        echo "${otool_out}" | grep -q "${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}" && return 0
+    fi
 
     return 1
 }
